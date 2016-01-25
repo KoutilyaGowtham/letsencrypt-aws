@@ -55,7 +55,12 @@ environment variable. This should be a JSON object with the following schema:
         {
             "elb": {
                 "name": "ELB name (string)",
-                "port": "optional, defaults to 443 (integer)"
+                "listener": {
+                    "load_balancer_port": "optional, defaults to 443 (integer)",
+                    "protocol": "optional, used with --create-listener flag",
+                    "instance_protocol": "optional, used with --create-listener flag",
+                    "instance_port": "optional, used with --create-listener flag"
+                }
             },
             "hosts": ["list of hosts you want on the certificate (strings)"],
             "key_type": "rsa or ecdsa, optional, defaults to rsa (string)"
@@ -117,6 +122,10 @@ If your `acme_account_key` is provided as an `s3://` URI you will also need:
 
 * `s3:GetObject`
 
+If you want to use the `--create-listener` flag you will also need:
+
+* `elasticloadbalancing:CreateLoadBalancerListeners`
+
 It's likely possible to restrict these permissions by ARN, though this has not
 been fully explored.
 
@@ -144,7 +153,8 @@ An example IAM policy is:
             "Effect": "Allow",
             "Action": [
                 "elasticloadbalancing:DescribeLoadBalancers",
-                "elasticloadbalancing:SetLoadBalancerListenerSSLCertificate"
+                "elasticloadbalancing:SetLoadBalancerListenerSSLCertificate",
+                "elasticloadbalancing:CreateLoadBalancerListeners"
             ],
             "Resource": [
                 "*"

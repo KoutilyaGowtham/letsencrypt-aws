@@ -21,6 +21,7 @@ import OpenSSL.crypto
 
 import rfc3986
 
+import botocore
 
 DEFAULT_ACME_DIRECTORY_URL = "https://acme-v01.api.letsencrypt.org/directory"
 CERTIFICATE_EXPIRATION_THRESHOLD = datetime.timedelta(days=45)
@@ -133,17 +134,18 @@ def generate_certificate_name(hosts, cert):
     )
 
 
-def get_load_balancer_certificate(elb_client, elb_name, elb_port):
+def get_load_balancer_certificate(elb_client, elb_name, listener):
+    elb_port = listener.get("load_balancer_port", 443)
     response = elb_client.describe_load_balancers(
         LoadBalancerNames=[elb_name]
     )
     [description] = response["LoadBalancerDescriptions"]
-    [certificate_id] = [
-        listener["Listener"]["SSLCertificateId"]
-        for listener in description["ListenerDescriptions"]
-        if listener["Listener"]["LoadBalancerPort"] == elb_port
-    ]
-    return certificate_id
+
+    for listener in description["ListenerDescriptions"]:
+        if listener["Listener"]["LoadBalancerPort"] == elb_port:
+            return listener["Listener"]["SSLCertificateId"]
+
+    return False
 
 
 def get_expiration_date_for_certificate(iam_client, ssl_certificate_arn):
@@ -245,9 +247,9 @@ def request_certificate(logger, acme_client, elb_name, authorizations, csr):
     return pem_certificate, pem_certificate_chain
 
 
-def add_certificate_to_elb(logger, elb_client, iam_client, elb_name, elb_port,
+def add_certificate_to_elb(logger, elb_client, iam_client, elb_name, listener,
                            hosts, private_key, pem_certificate,
-                           pem_certificate_chain):
+                           pem_certificate_chain, cert_only, create_listener):
     logger.emit("updating-elb.upload-iam-certificate", elb_name=elb_name)
     response = iam_client.upload_server_certificate(
         ServerCertificateName=generate_certificate_name(
@@ -264,37 +266,65 @@ def add_certificate_to_elb(logger, elb_client, iam_client, elb_name, elb_port,
     )
     new_cert_arn = response["ServerCertificateMetadata"]["Arn"]
 
+    if cert_only:
+        return
+
     # Sleep before trying to set the certificate, it appears to sometimes fail
     # without this.
     time.sleep(15)
     logger.emit("updating-elb.set-elb-certificate", elb_name=elb_name)
-    elb_client.set_load_balancer_listener_ssl_certificate(
-        LoadBalancerName=elb_name,
-        SSLCertificateId=new_cert_arn,
-        LoadBalancerPort=elb_port,
-    )
+    elb_port = listener.get("load_balancer_port", 443)
+    try:
+        logger.emit("updating-elb.update-listener", elb_name=elb_name)
+        elb_client.set_load_balancer_listener_ssl_certificate(
+            LoadBalancerName=elb_name,
+            SSLCertificateId=new_cert_arn,
+            LoadBalancerPort=elb_port,
+        )
+    except botocore.exceptions.ClientError as e:
+        if 'ListenerNotFound' not in str(e):
+            raise e
+
+        if not create_listener:
+            raise e
+
+        logger.emit("updating-elb.create-listener", elb_name=elb_name)
+        elb_client.create_load_balancer_listeners(
+            LoadBalancerName=elb_name,
+            Listeners=[
+                {
+                    'Protocol': listener['protocol'],
+                    'LoadBalancerPort': elb_port,
+                    'InstanceProtocol': listener['instance_protocol'],
+                    'InstancePort': listener['instance_port'],
+                    'SSLCertificateId': new_cert_arn,
+                }
+            ]
+        )
 
 
 def update_elb(logger, acme_client, elb_client, route53_client, iam_client,
-               force_issue, elb_name, elb_port, hosts, key_type):
+               force_issue, elb_name, listener, hosts, key_type, cert_only,
+               create_listener):
     logger.emit("updating-elb", elb_name=elb_name)
     certificate_id = get_load_balancer_certificate(
-        elb_client, elb_name, elb_port
+        elb_client, elb_name, listener
     )
 
-    expiration_date = get_expiration_date_for_certificate(
-        iam_client, certificate_id
-    ).date()
-    logger.emit(
-        "updating-elb.certificate-expiration",
-        elb_name=elb_name, expiration_date=expiration_date
-    )
-    days_until_expiration = expiration_date - datetime.date.today()
-    if (
-        days_until_expiration > CERTIFICATE_EXPIRATION_THRESHOLD and
-        not force_issue
-    ):
-        return
+    if certificate_id:
+        expiration_date = get_expiration_date_for_certificate(
+            iam_client, certificate_id
+        ).date()
+        logger.emit(
+            "updating-elb.certificate-expiration",
+            elb_name=elb_name, expiration_date=expiration_date
+        )
+        days_until_expiration = expiration_date - datetime.date.today()
+        if (
+            days_until_expiration > CERTIFICATE_EXPIRATION_THRESHOLD and
+            not force_issue
+        ):
+            return
 
     if key_type == "rsa":
         private_key = generate_rsa_private_key()
@@ -324,8 +354,9 @@ def update_elb(logger, acme_client, elb_client, route53_client, iam_client,
         add_certificate_to_elb(
             logger,
             elb_client, iam_client,
-            elb_name, elb_port, hosts,
-            private_key, pem_certificate, pem_certificate_chain
+            elb_name, listener, hosts,
+            private_key, pem_certificate, pem_certificate_chain,
+            cert_only, create_listener
         )
     finally:
         for authz_record in authorizations:
@@ -344,7 +375,7 @@ def update_elb(logger, acme_client, elb_client, route53_client, iam_client,
 
 
 def update_elbs(logger, acme_client, elb_client, route53_client, iam_client,
-                force_issue, domains):
+                force_issue, domains, cert_only, create_listener):
     for domain in domains:
         update_elb(
             logger,
@@ -354,9 +385,11 @@ def update_elbs(logger, acme_client, elb_client, route53_client, iam_client,
             iam_client,
             force_issue,
             domain["elb"]["name"],
-            domain["elb"].get("port", 443),
+            domain["elb"].get("listener", {'load_balancer_port': 443}),
             domain["hosts"],
-            domain.get("key_type", "rsa")
+            domain.get("key_type", "rsa"),
+            cert_only,
+            create_listener
         )
 
 
@@ -402,7 +435,19 @@ def cli():
         "expiration."
     )
 )
-def update_certificates(persistent=False, force_issue=False):
+@click.option(
+    "--cert-only", is_flag=True, help=(
+        "Only issue the certificate. Do not attempt to add the certificate "
+        "to the ELB."
+    )
+)
+@click.option(
+    "--create-listener", is_flag=True, help=(
+        "Create the HTTPS listener if it is missing."
+    )
+)
+def update_certificates(persistent=False, force_issue=False,
+                        cert_only=False, create_listener=False):
     logger = Logger()
     logger.emit("startup")
 
@@ -417,7 +462,7 @@ def update_certificates(persistent=False, force_issue=False):
 
     # Structure: {
     #     "domains": [
-    #         {"elb": {"name" "...", "port" 443}, hosts: ["..."]}
+    #         {"elb": {"name" "...", "listener": { ... }}, hosts: ["..."]}
     #     ],
     #     "acme_account_key": "s3://bucket/object",
     #     "acme_directory_url": "(optional)"
@@ -437,7 +482,7 @@ def update_certificates(persistent=False, force_issue=False):
         while True:
             update_elbs(
                 logger, acme_client, elb_client, route53_client, iam_client,
-                force_issue, domains
+                force_issue, domains, cert_only, create_listener
             )
             # Sleep before we check again
             logger.emit("sleeping", duration=PERSISTENT_SLEEP_INTERVAL)
@@ -446,7 +491,7 @@ def update_certificates(persistent=False, force_issue=False):
         logger.emit("running", mode="single")
         update_elbs(
             logger, acme_client, elb_client, route53_client, iam_client,
-            force_issue, domains
+            force_issue, domains, cert_only, create_listener
         )
 
 
